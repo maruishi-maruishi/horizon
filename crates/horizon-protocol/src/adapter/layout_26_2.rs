@@ -173,16 +173,47 @@ fn advancements(ids: &'static Ids, payload: &[u8]) -> Result<Vec<u8>> {
 /// `brigadier:string`, the same id in 26.2 and 26.3.
 const STRING_PARSER: i32 = 5;
 
+/// Per older release (its id tables): the synchronized registries the pinned release has and it lacks.
+static MISSING_REGISTRIES: std::sync::Mutex<Vec<(usize, std::collections::HashSet<String>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// The registries a client with `ids` lacks (the server knows them from that release's data): a command
+/// argument naming one is sent as a string the server checks.
+pub fn set_missing_registries(ids: &'static Ids, missing: impl IntoIterator<Item = String>) {
+    let key = std::ptr::from_ref(ids) as usize;
+    let mut all = MISSING_REGISTRIES.lock().unwrap();
+    if !all.iter().any(|(k, _)| *k == key) {
+        all.push((key, missing.into_iter().collect()));
+    }
+}
+
+pub(crate) fn lacks_registry(ids: &Ids, registry: &str) -> bool {
+    let key = std::ptr::from_ref(ids) as usize;
+    MISSING_REGISTRIES
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(k, set)| *k == key && set.contains(registry))
+}
+
 /// Each argument node's parser in 26.2's numbering. A parser 26.2 lacks becomes a string (a greedy one on
 /// a node nothing follows, a word otherwise) whose suggestions the client asks the server for, so the
 /// command still parses on the client and the server checks the argument.
 fn commands(ids: &Ids, payload: &[u8]) -> Result<Vec<u8>> {
     let mut tree = play::Commands::read(&mut Reader::new(payload))?;
     for node in &mut tree.nodes {
-        let Some((parser, _)) = &node.parser else {
+        let Some((parser, props)) = &node.parser else {
             continue;
         };
-        match ids.command_argument_type.down(*parser) {
+        let names_missing = matches!(
+            play::ArgumentProperties::decode(*parser, props),
+            Ok(play::ArgumentProperties::Registry(r)) if lacks_registry(ids, &r)
+        );
+        match ids
+            .command_argument_type
+            .down(*parser)
+            .filter(|_| !names_missing)
+        {
             Some(old) => {
                 if let Some(p) = &mut node.parser {
                     p.0 = old;

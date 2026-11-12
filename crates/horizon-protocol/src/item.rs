@@ -1115,7 +1115,51 @@ impl Codec<Option<Stack>> for Slot {
         write_slot(v.as_ref(), w);
     }
 }
+/// For an older client (docs/older-clients.md), a stand-in for an item its release lacks says what it
+/// really is: a gray first lore line "26.3: Poplar Log". `None` when nothing is marked.
+fn marked(s: &Stack) -> Option<Stack> {
+    let (ids, way) = ids::active()?;
+    if !matches!(way, ids::Way::Down) || ids.item.down(s.item).is_some() {
+        return None;
+    }
+    ids::down_or_substitute(ids.item, ids.substitutes.item, s.item)?;
+    let name = ids::pinned_item_name(s.item)?;
+    let path = name.strip_prefix("minecraft:").unwrap_or(&name);
+    let pretty: Vec<String> = path
+        .split('_')
+        .map(|w| {
+            let mut c = w.chars();
+            c.next()
+                .map(|f| f.to_uppercase().chain(c).collect())
+                .unwrap_or_default()
+        })
+        .collect();
+    let line = Tag::compound([
+        (
+            "text",
+            Tag::String(horizon_world::nbt::JavaString::from(
+                format!("26.3: {}", pretty.join(" ")).as_str(),
+            )),
+        ),
+        ("color", Tag::String(horizon_world::nbt::JavaString::from("gray"))),
+        ("italic", Tag::Byte(0)),
+    ]);
+    let mut s = s.clone();
+    match s.added.iter_mut().find(|(k, _)| *k == component::LORE) {
+        Some((_, Component::Lore(lines))) => lines.insert(0, line),
+        _ => {
+            s.added.retain(|(k, _)| *k != component::LORE);
+            s.added.push((component::LORE, Component::Lore(vec![line])));
+        }
+    }
+    s.removed.retain(|k| *k != component::LORE);
+    s.wire = WirePatch::default();
+    Some(s)
+}
+
 fn write_slot(v: Option<&Stack>, w: &mut Writer) {
+    let marked_stack = v.and_then(marked);
+    let v = marked_stack.as_ref().or(v);
     if v1_20_3::writing() {
         v1_20_3::write_stack(v, w);
         return;
@@ -1387,6 +1431,8 @@ impl Codec<Stack> for Template {
             write_slot(Some(s), w);
             return;
         }
+        let marked_stack = marked(s);
+        let s = marked_stack.as_ref().unwrap_or(s);
         w.varint(ids::item(s.item));
         w.varint(s.count);
         write_patch(s, w);

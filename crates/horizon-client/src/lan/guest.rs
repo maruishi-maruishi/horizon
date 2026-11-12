@@ -219,6 +219,8 @@ pub struct Guest {
     /// A position move arrived since the client's last ClientTickEnd
     /// (receivedPositionThisTick): a second one is a protocol error.
     pub position_this_tick: bool,
+    /// The client sends ClientTickEnd (1.21.4 and later): only then is a second move in a tick an error.
+    pub sends_tick_end: bool,
     /// Violation levels and the checks' state (the anticheat, when on).
     pub anticheat: horizon_anticheat::Player,
     /// The movement prediction's replay of the client's own moves (only while it runs).
@@ -518,6 +520,7 @@ impl Guest {
             rests_on_ground: false,
             support_blocks_sent: 0,
             position_this_tick: false,
+            sends_tick_end: false,
             anticheat: Default::default(),
             replay: None,
             changes: Default::default(),

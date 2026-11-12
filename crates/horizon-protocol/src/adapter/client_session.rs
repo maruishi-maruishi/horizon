@@ -81,6 +81,9 @@ pub struct ClientSession {
     entities: Mutex<HashMap<i32, (i32, u128)>>,
     /// The hotbar slot the client holds (0..=8), for the swap a 1.21.3 client's `pick_item` becomes.
     held: AtomicU8,
+    /// The client's last packet was an `accept_teleportation`: an older client sends the position it
+    /// was teleported to right after it, which 26.3's acceptance already carries.
+    accepted: std::sync::atomic::AtomicBool,
 }
 
 /// A position, yaw and pitch.
@@ -169,6 +172,7 @@ impl ClientSession {
             teleports: Mutex::new(VecDeque::new()),
             entities: Mutex::new(HashMap::new()),
             held: AtomicU8::new(0),
+            accepted: std::sync::atomic::AtomicBool::new(false),
         }
     }
     fn hold(&self, slot: i32) {
@@ -244,6 +248,16 @@ impl ClientSession {
             return Ok(None);
         };
         use packet_ids::play::serverbound as sb;
+        // LocalPlayer's handleMovePlayer: an older client follows its acceptance with a move to where it
+        // was put. 26.3's acceptance carries that place and takes it; a second move before the tick's end
+        // is a protocol error there, so the follow-up move goes no further.
+        let accepted = self
+            .accepted
+            .swap((state, pinned) == (State::Play, sb::ACCEPT_TELEPORTATION), Ordering::AcqRel);
+        if accepted && (state, pinned) == (State::Play, sb::MOVE_PLAYER_POS_ROT) {
+            self.moved(pinned, &payload)?;
+            return Ok(None);
+        }
         let payload = match (state, pinned) {
             (State::Play, sb::ACCEPT_TELEPORTATION) => self.accept_teleport(&payload)?,
             // 26.3 inserted CHANGE_DESTROY_DIRECTION at 1: 26.2's actions past 0 are one up.
@@ -375,7 +389,7 @@ impl ClientSession {
         if state != State::Play
             || !matches!(
                 id,
-                cb::ADD_ENTITY | cb::REMOVE_ENTITIES | cb::SET_ENTITY_DATA
+                cb::ADD_ENTITY | cb::REMOVE_ENTITIES | cb::SET_ENTITY_DATA | cb::LOGIN
             )
         {
             return Ok(None);
@@ -383,6 +397,12 @@ impl ClientSession {
         let mut p = play::Clientbound::decode(id, payload)?;
         let mut entities = self.entities.lock().unwrap();
         match &mut p {
+            // The client's own player is never added: its entity data (skin layers, main hand) is a
+            // player's too.
+            play::Clientbound::Login(l) => {
+                entities.insert(l.player_id, (super::pinned_ids::entity_type::PLAYER, 0));
+                return Ok(None);
+            }
             play::Clientbound::AddEntity(e) => {
                 entities.insert(e.id, (e.kind, e.uuid));
             }
@@ -390,6 +410,18 @@ impl ClientSession {
                 for id in &r.ids {
                     entities.remove(id);
                 }
+            }
+            // An entity the client's release lacks is shown as a stand-in, which would read the entity's
+            // own data at its indexes (a 26.3 cushion's dye color): the stand-in keeps its defaults.
+            play::Clientbound::SetEntityData(d)
+                if entities.get(&d.id).is_some_and(|&(kind, _)| {
+                    self.version
+                        .ids()
+                        .is_some_and(|ids| ids.entity_type.down(kind).is_none())
+                }) =>
+            {
+                d.values.clear();
+                return Ok(Some(strip_id(p.encode())));
             }
             play::Clientbound::SetEntityData(d)
                 if self.version.at_most(ServerVersion::V1_21_11) =>
@@ -431,6 +463,18 @@ impl ClientSession {
             && matches!(
                 id,
                 packet_ids::play::clientbound::UPDATE_RECIPES
+                    | packet_ids::play::clientbound::PLACE_GHOST_RECIPE
+            )
+        {
+            return Ok(None);
+        }
+        // Personal server (docs/older-clients.md): the recipe book's displays changed in 26.1 in ways the
+        // steps don't write yet, so a 1.21.11 or older client gets an empty recipe book (crafting works).
+        if v.at_most(ServerVersion::V1_21_11)
+            && state == State::Play
+            && matches!(
+                id,
+                packet_ids::play::clientbound::RECIPE_BOOK_ADD
                     | packet_ids::play::clientbound::PLACE_GHOST_RECIPE
             )
         {
@@ -486,6 +530,26 @@ impl ClientSession {
             && let Some(next) = step_1_21_4::clientbound(state, id, &payload)?
         {
             payload = next;
+        }
+        // 1.21.4 added the player list's UPDATE_HAT (bit 7) and its boolean: a 1.21.3 client gets neither,
+        // and a packet that only changed hats is not sent.
+        if v.at_most(ServerVersion::V1_21_3)
+            && (state, id) == (State::Play, packet_ids::play::clientbound::PLAYER_INFO_UPDATE)
+        {
+            use crate::buf::Codec;
+            let mut p = play::PlayerInfoUpdate::read(&mut Reader::new(&payload))?;
+            if p.actions & 0x80 != 0 {
+                p.actions &= 0x7F;
+                if p.actions == 0 {
+                    return Ok(None);
+                }
+                for e in &mut p.entries {
+                    e.show_hat = None;
+                }
+                let mut w = Writer::new();
+                play::PlayerInfoUpdate::write(&p, &mut w);
+                payload = w.data;
+            }
         }
         // 1.21.1 is older than 1.21.2 and than 1.21.4: its packets are brought down after those, and before 1.20.6's.
         if v.at_most(ServerVersion::V1_21_1)
@@ -705,7 +769,9 @@ fn encode_down(ids: &'static Ids, p: &play::Clientbound) -> Vec<u8> {
 /// The registry ids in a pinned clientbound packet, renumbered for the older client.
 fn down(ids: &'static Ids, state: State, id: i32, payload: &[u8]) -> Result<Sent> {
     use packet_ids::play::clientbound as cb;
-    let tags = |registries: &mut [configuration::RegistryTags]| {
+    let tags = |registries: &mut Vec<configuration::RegistryTags>| {
+        // Tags of a registry the client's release lacks would fail the whole packet.
+        registries.retain(|r| !layout_26_2::lacks_registry(ids, &r.registry));
         for registry in registries {
             let remap = ids.by_registry(&registry.registry);
             for tag in &mut registry.tags {
@@ -727,6 +793,16 @@ fn down(ids: &'static Ids, state: State, id: i32, payload: &[u8]) -> Result<Sent
     }
     if state != State::Play {
         return Ok(Sent::AsIs);
+    }
+    if id == cb::UPDATE_RECIPES {
+        return Ok(Sent::Rewritten(update_recipes_down(ids, payload)?));
+    }
+    if id == cb::SYSTEM_CHAT {
+        let mut p = play::Clientbound::decode(id, payload)?;
+        if let play::Clientbound::SystemChat(chat) = &mut p {
+            text_down(ids, &mut chat.content);
+        }
+        return Ok(Sent::Rewritten(strip_id(p.encode())));
     }
     // Packets whose layout 26.2 has differently (world.rs).
     if let Some(sent) = world::down(ids, id, payload)? {
@@ -760,10 +836,175 @@ fn down(ids: &'static Ids, state: State, id: i32, payload: &[u8]) -> Result<Sent
     if let play::Clientbound::UpdateTags(t) = &mut p {
         tags(&mut t.registries);
     }
+    // A recipe naming an item the client has nothing for would reach it as id -1.
+    if let play::Clientbound::RecipeBookAdd(a) = &mut p {
+        a.entries.retain(|e| recipe_shown(ids, e));
+    }
     Ok(match renumber(ids, &mut p) {
         Some(()) => Sent::Rewritten(encode_down(ids, &p)),
         None => Sent::Dropped,
     })
+}
+
+/// A text component for an older client: a `show_item` hover names the item as the client does (its
+/// stand-in, without the pinned components it may not read); one it has nothing for loses the hover. A
+/// client that can't read one item in a message rejects the whole packet.
+fn text_down(ids: &Ids, tag: &mut horizon_world::nbt::Tag) {
+    use horizon_world::nbt::{JavaString, Tag};
+    match tag {
+        Tag::List(items) => items.iter_mut().for_each(|t| text_down(ids, t)),
+        Tag::Compound(map) => {
+            let hover = JavaString::from("hover_event");
+            let item_name = map.get(&hover).and_then(|h| {
+                (h.get("action")? == &Tag::String(JavaString::from("show_item")))
+                    .then(|| match h.get("id") {
+                        Some(Tag::String(s)) => Some(s.to_string_lossy()),
+                        _ => None,
+                    })
+                    .flatten()
+            });
+            if let Some(name) = item_name {
+                match ids::item_name_down(ids, &name) {
+                    Some(same) if same == name => {}
+                    Some(standin) => {
+                        if let Some(Tag::Compound(h)) = map.get_mut(&hover) {
+                            h.insert(JavaString::from("id"), Tag::String(JavaString::from(standin.as_str())));
+                            h.remove(&JavaString::from("components"));
+                        }
+                    }
+                    None => {
+                        map.remove(&hover);
+                    }
+                }
+            }
+            map.values_mut().for_each(|t| text_down(ids, t));
+        }
+        _ => {}
+    }
+}
+
+/// Every item id a recipe book slot display names.
+fn slot_items(d: &crate::packets::recipes::SlotDisplay, out: &mut Vec<i32>) {
+    use crate::packets::recipes::{HolderSet, SlotDisplay as S};
+    match d {
+        S::Empty | S::AnyFuel | S::Tag(HolderSet::Tag(_)) => {}
+        S::Item(id) => out.push(*id),
+        S::ItemStack(s) => out.push(s.item),
+        S::Tag(HolderSet::Items(ids)) => out.extend(ids),
+        S::WithAnyPotion(inner) | S::OnlyWithComponent(inner, _) => slot_items(inner, out),
+        S::Dyed { dye, target } => {
+            slot_items(dye, out);
+            slot_items(target, out);
+        }
+        S::SmithingTrim { base, material, .. } => {
+            slot_items(base, out);
+            slot_items(material, out);
+        }
+        S::WithRemainder { input, remainder } => {
+            slot_items(input, out);
+            slot_items(remainder, out);
+        }
+        S::Composite(list) => list.iter().for_each(|s| slot_items(s, out)),
+    }
+}
+
+/// Whether an older client has (or has a stand-in for) every item a recipe book entry shows.
+fn recipe_shown(ids: &Ids, e: &crate::packets::recipes::RecipeBookEntry) -> bool {
+    use crate::packets::recipes::RecipeDisplay as D;
+    let mut items = Vec::new();
+    match &e.display {
+        D::Shapeless { ingredients, result, station }
+        | D::Shaped { ingredients, result, station, .. } => {
+            ingredients.iter().for_each(|s| slot_items(s, &mut items));
+            slot_items(result, &mut items);
+            slot_items(station, &mut items);
+        }
+        D::Furnace { ingredient, fuel, result, station, .. } => {
+            for s in [ingredient, fuel, result, station] {
+                slot_items(s, &mut items);
+            }
+        }
+        D::Stonecutter { input, result, station } => {
+            for s in [input, result, station] {
+                slot_items(s, &mut items);
+            }
+        }
+        D::Smithing { template, base, addition, result, station } => {
+            for s in [template, base, addition, result, station] {
+                slot_items(s, &mut items);
+            }
+        }
+    }
+    for set in e.requirements.iter().flatten() {
+        if let crate::packets::recipes::HolderSet::Items(list) = set {
+            items.extend(list);
+        }
+    }
+    items
+        .into_iter()
+        .all(|id| down_or_substitute(ids.item, ids.substitutes.item, id).is_some())
+}
+
+/// ClientboundUpdateRecipesPacket in the older client's item ids: the recipe property sets (item ids;
+/// an item it has no stand-in for is left out) and the stonecutter recipes (an input holder set, then an
+/// item-stack slot display: its display type, item, count and an empty patch).
+fn update_recipes_down(ids: &Ids, payload: &[u8]) -> Result<Vec<u8>> {
+    let item = |id: i32| down_or_substitute(ids.item, ids.substitutes.item, id);
+    let mut r = Reader::new(payload);
+    let mut w = Writer::new();
+    let sets = r.varint()?;
+    w.varint(sets);
+    for _ in 0..sets {
+        w.string(&r.string(32767)?);
+        let n = r.varint()?;
+        let kept: Vec<i32> = (0..n)
+            .map(|_| r.varint())
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(item)
+            .collect();
+        w.varint(kept.len() as i32);
+        for id in kept {
+            w.varint(id);
+        }
+    }
+    // A recipe whose result the client has nothing for is left out (an empty result is an error).
+    let recipes = r.varint()?;
+    let mut kept_recipes = 0;
+    let mut body = Writer::new();
+    for _ in 0..recipes {
+        let mut one = Writer::new();
+        let holders = r.varint()?;
+        if holders == 0 {
+            one.varint(0);
+            one.string(&r.string(32767)?);
+        } else {
+            let kept: Vec<i32> = (0..holders - 1)
+                .map(|_| r.varint())
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .filter_map(item)
+                .collect();
+            one.varint(kept.len() as i32 + 1);
+            for id in kept {
+                one.varint(id);
+            }
+        }
+        let display = r.varint()?;
+        one.varint(ids.slot_display.down(display).unwrap_or(display));
+        let result = item(r.varint()?).filter(|&id| id != 0);
+        one.varint(result.unwrap_or(0));
+        one.varint(r.varint()?); // count
+        one.varint(r.varint()?); // components added (none)
+        one.varint(r.varint()?); // nor removed
+        if result.is_some() {
+            kept_recipes += 1;
+            body.bytes(&one.data);
+        }
+    }
+    w.varint(kept_recipes);
+    w.bytes(&body.data);
+    Ok(w.data)
 }
 
 /// The plain registry ids in a decoded play packet, renumbered for the older client: `None` when it names
@@ -832,6 +1073,15 @@ fn renumber(ids: &Ids, p: &mut play::Clientbound) -> Option<()> {
         play::Clientbound::SetEntityData(d) => {
             d.values
                 .retain_mut(|(_, kind, value)| entity_value(ids, *kind, value));
+            // The serializer ids in the client's EntityDataSerializers order (a type its release lacks
+            // has no value it could read).
+            d.values.retain_mut(|(_, kind, _)| match ids.entity_data_serializer.down(*kind) {
+                Some(older) => {
+                    *kind = older;
+                    true
+                }
+                None => false,
+            });
             Some(())
         }
         // Item stacks and recipe displays: their writers renumber items and components (encode_down).

@@ -1284,10 +1284,36 @@ fn login_and_configure(
         id: CORE_PACK.1.into(),
         version: CORE_PACK.2.into(),
     };
+    // A vanilla client of an older release is offered its own core pack (each patch release's
+    // version), so it rebuilds the registry entries it has from its own data.
+    let older = c.older_client().and_then(|v| sync.older(v.protocol()));
+    if older.is_some()
+        && let Some(items) = sync.builtin.get("minecraft:item")
+    {
+        horizon_protocol::adapter::ids::set_pinned_item_names(items);
+    }
+    if let (Some(o), Some(ids)) = (&older, c.older_client().and_then(|v| v.ids())) {
+        horizon_protocol::adapter::layout_26_2::set_missing_registries(
+            ids,
+            sync.older_missing_registries(o),
+        );
+    }
+    let offered: Vec<KnownPack> = match &older {
+        Some(o) => o
+            .core_versions
+            .iter()
+            .map(|version| KnownPack {
+                namespace: CORE_PACK.0.into(),
+                id: CORE_PACK.1.into(),
+                version: version.clone(),
+            })
+            .collect(),
+        None => vec![core.clone()],
+    };
     send(
         c,
         cfg::Clientbound::SelectKnownPacks(cfg::SelectKnownPacks {
-            packs: vec![core.clone()],
+            packs: offered.clone(),
         }),
     )?;
     let mut info = ClientInformation::new(10);
@@ -1304,7 +1330,12 @@ fn login_and_configure(
                     .string(32767)
                     .unwrap_or(brand);
             }
-            cfg::Serverbound::SelectKnownPacks(p) => break p.packs == vec![core.clone()],
+            cfg::Serverbound::SelectKnownPacks(p) => {
+                break match &older {
+                    Some(_) => p.packs.len() == 1 && offered.contains(&p.packs[0]),
+                    None => p.packs == vec![core.clone()],
+                };
+            }
             _ => {}
         }
     };
@@ -1458,10 +1489,18 @@ fn login_and_configure(
             return Ok(None);
         }
     }
-    for packet in sync.registry_packets(known_pack, &shared.config.levels) {
+    let packets = match &older {
+        Some(o) if known_pack => sync.older_registry_packets(o),
+        _ => sync.registry_packets(known_pack, &shared.config.levels),
+    };
+    for packet in packets {
         send(c, cfg::Clientbound::RegistryData(packet))?;
     }
-    send(c, cfg::Clientbound::UpdateTags(sync.tags.clone()))?;
+    let tags = match &older {
+        Some(o) if known_pack => sync.older_tags(o),
+        _ => sync.tags.clone(),
+    };
+    send(c, cfg::Clientbound::UpdateTags(tags))?;
     // addOptionalTasks: the code of conduct task comes first.
     if let Some(text) =
         super::code_of_conduct::pick(&shared.config.code_of_conducts, &info.language)

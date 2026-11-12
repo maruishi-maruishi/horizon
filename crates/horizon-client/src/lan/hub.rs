@@ -4106,6 +4106,9 @@ impl Hub {
                         }
                         g.position = at;
                         g.awaiting_teleport = None;
+                        // An older client (1.21.3) confirms with a move just before the acceptance; that
+                        // move was the teleport's, not the tick's.
+                        g.position_this_tick = false;
                         // The prediction's replay starts again where the client now is.
                         if recording {
                             let kept = g.awaiting_keeps_motion;
@@ -4187,6 +4190,7 @@ impl Hub {
                         g.known_movement = [0.0; 3];
                     }
                     g.position_this_tick = false;
+                    g.sends_tick_end = true;
                     self.anticheat_tick_end(i, events);
                 }
                 // ServerGamePacketListenerImpl.handleRecipeBookSeenRecipePacket:
@@ -4406,7 +4410,8 @@ impl Hub {
         }
         let g = &mut self.guests[i];
         if pos.is_some() {
-            if g.position_this_tick {
+            // An older client (1.21.3 and before) has no ClientTickEnd to mark its ticks.
+            if g.position_this_tick && g.sends_tick_end {
                 self.kick(conn, invalid_movement());
                 return;
             }

@@ -1038,6 +1038,14 @@ impl Game<'_> {
         let lists = Arc::new(Mutex::new(lists));
         self.server_lists = Some(lists.clone());
         log("INFO", &format!("Preparing level \"{level_name}\""));
+        // Personal server: older clients get 26.2's layouts of the packets 26.3 changed.
+        if props
+            .raw
+            .get(horizon_client::lan::ACCEPT_OLDER_CLIENTS)
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+        {
+            horizon_protocol::adapter::layout_26_2::set_enabled(true);
+        }
         let folder = world_dir.to_string_lossy().into_owned();
         // The mods' common and server configs, read before the server starts.
         self.native_configs_server_start(&world_dir, true);
@@ -1185,7 +1193,12 @@ impl Game<'_> {
                 .raw
                 .get(horizon_client::lan::ACCEPT_OLDER_CLIENTS)
                 .is_some_and(|v| v.trim().eq_ignore_ascii_case("true")),
-            older_clients_play: false,
+            // Personal server: an older client that is let in plays (1.20.5 to 26.2, translated by
+            // horizon-protocol's client_session; docs/older-clients.md).
+            older_clients_play: props
+                .raw
+                .get(horizon_client::lan::ACCEPT_OLDER_CLIENTS)
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("true")),
             lod_distance: horizon_client::lod_net::distance_property(
                 props.raw.get(horizon_client::lod_net::PROPERTY),
             ),

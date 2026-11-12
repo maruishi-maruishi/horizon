@@ -10,7 +10,7 @@ use horizon_protocol::{
 use horizon_world::nbt::{JavaString, Tag};
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -133,6 +133,101 @@ pub struct SyncData {
     /// ClientboundUpdateRecipesPacket's payload.
     pub recipes: Vec<u8>,
     pub advancements: super::advancements::ServerAdvancements,
+    /// `<resources>/older`: what clients of older releases know (tools/prepare_older_clients.py).
+    pub older_dir: PathBuf,
+}
+
+/// One synchronized registry as a client of an older release has it.
+pub struct OlderRegistry {
+    /// The entries its own vanilla data has, which it rebuilds itself from its core pack.
+    names: HashSet<String>,
+    /// The data of one of them, valid for that release: what an entry it lacks is sent as.
+    standin: Option<Tag>,
+}
+
+/// What a vanilla client of an older release knows (docs/older-clients.md).
+pub struct OlderRelease {
+    pub release: String,
+    /// The core pack versions its clients report (patch releases share a protocol).
+    pub core_versions: Vec<String>,
+    registries: HashMap<String, OlderRegistry>,
+    /// Its own vanilla tags by registry, then tag name: the values as its tag files list them.
+    tags: HashMap<String, HashMap<String, Vec<Value>>>,
+}
+
+impl OlderRelease {
+    fn parse(text: &str) -> Option<Self> {
+        let v: Value = serde_json::from_str(text).ok()?;
+        let raw = v.get("registries")?.as_object()?;
+        let mut registries: HashMap<String, OlderRegistry> = HashMap::new();
+        // A registry's nested folders (`enchantment_provider/raid/x.json`) are its entries
+        // `raid/x`: they fold into the shortest registry key that is a prefix.
+        let mut keys: Vec<&String> = raw.keys().collect();
+        keys.sort_by_key(|k| k.len());
+        for key in keys {
+            let r = &raw[key];
+            let names = r
+                .get("entries")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str);
+            let parent = registries
+                .keys()
+                .find(|p| key.starts_with(&format!("{p}/")))
+                .cloned();
+            match parent {
+                Some(p) => {
+                    let sub = &key[p.len() + 1..];
+                    let reg = registries.get_mut(&p).expect("found");
+                    for n in names {
+                        let path = n.strip_prefix("minecraft:").unwrap_or(n);
+                        reg.names.insert(format!("minecraft:{sub}/{path}"));
+                    }
+                }
+                None => {
+                    registries.insert(
+                        key.clone(),
+                        OlderRegistry {
+                            names: names.map(str::to_owned).collect(),
+                            standin: r.get("standin").filter(|s| !s.is_null()).map(json_to_nbt),
+                        },
+                    );
+                }
+            }
+        }
+        Some(Self {
+            release: v.get("release")?.as_str()?.to_owned(),
+            core_versions: v
+                .get("core_versions")?
+                .as_array()?
+                .iter()
+                .filter_map(|s| s.as_str().map(str::to_owned))
+                .collect(),
+            registries,
+            tags: v
+                .get("tags")
+                .and_then(Value::as_object)
+                .map(|regs| {
+                    regs.iter()
+                        .map(|(reg, tags)| {
+                            let tags = tags
+                                .as_object()
+                                .map(|t| {
+                                    t.iter()
+                                        .map(|(n, vals)| {
+                                            (n.clone(), vals.as_array().cloned().unwrap_or_default())
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            (reg.clone(), tags)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        })
+    }
 }
 
 use crate::crafting::qualified;
@@ -242,8 +337,148 @@ impl SyncData {
                 HashMap::new(),
             ),
             content_identity: None,
+            older_dir: PathBuf::new(),
         }
     }
+
+    /// What a client of the older release with `protocol` knows, from `<resources>/older`;
+    /// None when that release was not prepared. Read once per protocol.
+    pub fn older(&self, protocol: i32) -> Option<std::sync::Arc<OlderRelease>> {
+        type Cache = std::sync::Mutex<HashMap<(PathBuf, i32), Option<std::sync::Arc<OlderRelease>>>>;
+        static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+        let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+        cache
+            .entry((self.older_dir.clone(), protocol))
+            .or_insert_with(|| {
+                let path = self.older_dir.join(format!("{protocol}.json"));
+                let release = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|t| OlderRelease::parse(&t));
+                if release.is_none() {
+                    log::warn!(
+                        "Horizon: {} is missing or unreadable; run tools/prepare_older_clients.py",
+                        path.display()
+                    );
+                }
+                release.map(std::sync::Arc::new)
+            })
+            .clone()
+    }
+
+    /// ClientboundRegistryDataPacket per registry for a vanilla client of an older release
+    /// that confirmed its core pack: the server's entries in the server's order (every id the
+    /// server sends stays valid), an entry that release has without data (the client reads its
+    /// own), one it lacks as that release's stand-in data under its own name. A registry the
+    /// release doesn't have is not sent.
+    /// The tags for a client of an older release: the server's, and every tag of the release's own
+    /// vanilla data the server lacks (its enchantments and other built-in entries name them), built
+    /// from the release's tag files over the server's entries and tags. In the server's ids; the
+    /// connection renumbers them.
+    pub fn older_tags(&self, older: &OlderRelease) -> UpdateTags {
+        fn bare(name: &str) -> &str {
+            name.strip_prefix('#')
+                .unwrap_or(name)
+                .strip_prefix("minecraft:")
+                .unwrap_or(name.strip_prefix('#').unwrap_or(name))
+        }
+        let mut out = self.tags.clone();
+        for (registry, old) in &older.tags {
+            let Some(rt) = out.registries.iter_mut().find(|r| &r.registry == registry) else {
+                continue;
+            };
+            let server: HashMap<String, Vec<i32>> = rt
+                .tags
+                .iter()
+                .map(|t| (bare(&t.name).to_owned(), t.ids.clone()))
+                .collect();
+            let old_by_bare: HashMap<&str, &Vec<Value>> =
+                old.iter().map(|(n, v)| (bare(n), v)).collect();
+            let prefixed = rt.tags.first().is_none_or(|t| t.name.starts_with("minecraft:"));
+            fn resolve(
+                sync: &SyncData,
+                registry: &str,
+                tag: &str,
+                old: &HashMap<&str, &Vec<Value>>,
+                server: &HashMap<String, Vec<i32>>,
+                out: &mut BTreeSet<i32>,
+                depth: u32,
+            ) {
+                if depth > 16 {
+                    return;
+                }
+                if let Some(ids) = server.get(tag) {
+                    out.extend(ids);
+                    return;
+                }
+                for value in old.get(tag).into_iter().flat_map(|v| v.iter()) {
+                    let entry = match value {
+                        Value::String(s) => s.as_str(),
+                        Value::Object(o) => o.get("id").and_then(Value::as_str).unwrap_or(""),
+                        _ => "",
+                    };
+                    if let Some(t) = entry.strip_prefix('#') {
+                        let t = t.strip_prefix("minecraft:").unwrap_or(t);
+                        resolve(sync, registry, t, old, server, out, depth + 1);
+                    } else if let Some(id) = sync.id(registry, entry) {
+                        out.insert(id);
+                    }
+                }
+            }
+            for name in old.keys() {
+                let b = bare(name);
+                if server.contains_key(b) {
+                    continue;
+                }
+                let mut ids = BTreeSet::new();
+                resolve(self, registry, b, &old_by_bare, &server, &mut ids, 0);
+                rt.tags.push(TagEntry {
+                    name: if prefixed {
+                        format!("minecraft:{b}")
+                    } else {
+                        b.to_owned()
+                    },
+                    ids: ids.into_iter().collect(),
+                });
+            }
+        }
+        out
+    }
+
+    /// The synchronized registries the server has and the older release lacks.
+    pub fn older_missing_registries(&self, older: &OlderRelease) -> Vec<String> {
+        self.registries
+            .iter()
+            .map(|(key, _)| key)
+            .filter(|key| !older.registries.contains_key(*key))
+            .cloned()
+            .collect()
+    }
+
+    pub fn older_registry_packets(&self, older: &OlderRelease) -> Vec<RegistryData> {
+        self.registries
+            .iter()
+            .filter_map(|(key, e)| {
+                let reg = older.registries.get(key)?;
+                Some(RegistryData {
+                    registry: key.clone(),
+                    entries: e
+                        .names
+                        .iter()
+                        .zip(&e.data)
+                        .map(|(name, data)| RegistryEntry {
+                            id: name.clone(),
+                            data: if reg.names.contains(name) {
+                                None
+                            } else {
+                                Some(reg.standin.clone().unwrap_or_else(|| data.clone()))
+                            },
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+
     pub fn load(
         resources: &Path,
         overlay: &horizon_world::loot::PackOverlay,
@@ -451,6 +686,7 @@ impl SyncData {
             None
         };
         let mut sync = Self {
+            older_dir: resources.join("older"),
             content_identity,
             builtin,
             dynamic,

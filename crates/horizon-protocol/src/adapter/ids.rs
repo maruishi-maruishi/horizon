@@ -297,6 +297,32 @@ pub(crate) fn trim_pattern(item: i32) -> Option<i32> {
     TRIM_PATTERNS.with_borrow(|patterns| patterns.get(&item).copied())
 }
 
+static PINNED_ITEMS: std::sync::OnceLock<crate::registry::Ids> = std::sync::OnceLock::new();
+
+/// The pinned release's item names in id order, which the server knows (its builtin registries):
+/// text an older client reads names items, and needs them as it names them ([`item_name_down`]).
+pub fn set_pinned_item_names(names: &crate::registry::Ids) {
+    let _ = PINNED_ITEMS.set(names.clone());
+}
+
+/// A pinned item id's name, when the server gave the names ([`set_pinned_item_names`]).
+pub fn pinned_item_name(id: i32) -> Option<String> {
+    PINNED_ITEMS.get()?.name(id).map(str::to_owned)
+}
+
+/// A pinned item name as an older client (`ids`) names it: itself when the client has it, its
+/// stand-in's name when it has one, else None.
+pub fn item_name_down(ids: &Ids, name: &str) -> Option<String> {
+    let table = PINNED_ITEMS.get()?;
+    let pinned = table.id(name)?;
+    if ids.item.down(pinned).is_some() {
+        return Some(name.to_owned());
+    }
+    let older = down_or_substitute(ids.item, ids.substitutes.item, pinned)?;
+    let back = ids.item.up(older)?;
+    table.name(back).map(str::to_owned)
+}
+
 /// Renumber ids `way` on this thread until the guard drops. Readers and writers that pick a layout by an id
 /// (item stacks, data components, particles) consult it through [`item`], [`component`] and [`particle`].
 pub fn renumbering(ids: &'static Ids, way: Way) -> Guard {
