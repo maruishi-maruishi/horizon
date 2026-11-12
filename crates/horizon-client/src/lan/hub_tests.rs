@@ -68,6 +68,49 @@ fn hub_with_sync(sync: SyncData) -> (Hub, std::sync::mpsc::Receiver<crate::lan::
     (hub, rx)
 }
 
+/// ServerPlayer.updateOptions: a vanilla client draws its own outer skin layers, cape and arm
+/// from the entity data the server sends it, so the player gets them too, and again when
+/// they change.
+#[test]
+fn own_skin_layers_and_main_hand_reach_the_player() {
+    fn own_look(rx: &std::sync::mpsc::Receiver<crate::lan::Out>) -> Vec<Vec<(u8, i32, Value)>> {
+        let mut frames = Vec::new();
+        while let Ok(out) = rx.try_recv() {
+            let crate::lan::Out::Packet(body) = out else {
+                continue;
+            };
+            let mut r = horizon_protocol::buf::Reader::new(&body);
+            let id = r.varint().unwrap();
+            if let Ok(C::SetEntityData(p)) = C::decode(id, r.rest())
+                && p.id == 1
+                && p.values.iter().any(|(i, _, _)| *i == 15 || *i == 16)
+            {
+                frames.push(p.values);
+            }
+        }
+        frames
+    }
+    let (mut hub, rx) = hub_with_a_guest();
+    hub.sync_player_state(0);
+    // Every layer on (the client's default settings); the right arm is the entity's default.
+    assert_eq!(
+        own_look(&rx),
+        [vec![(16, serializer::BYTE, Value::Byte(0x7F))]]
+    );
+    hub.sync_player_state(0);
+    assert!(own_look(&rx).is_empty(), "sent once");
+    hub.guests[0].info.main_hand = 0;
+    hub.guests[0].info.model_customisation = 0x7E; // the cape off
+    hub.sync_player_state(0);
+    assert_eq!(
+        own_look(&rx),
+        [vec![
+            (16, serializer::BYTE, Value::Byte(0x7E)),
+            (15, serializer::HUMANOID_ARM, Value::Id(0)),
+        ]]
+    );
+}
+
 // Added after the old connected/Game pair: sender lifecycle controls only.
 #[test]
 fn self_pose_wire_lifecycle_preserves_existing_publishers() {

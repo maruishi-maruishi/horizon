@@ -935,6 +935,11 @@ impl Game<'_> {
         let new_world = !world_dir.join("level.dat").exists();
         if new_world {
             self.write_world_gen(&world_dir, &props)?;
+            // Personal server: a world created here starts in Horizon's own storage
+            // (docs/horizon-storage.md); folders that already hold `.mca` chunks are left alone.
+            if horizon_world::tiered::adopt_new_world(&world_dir)? {
+                log("INFO", "New world: saving in Horizon storage (hzr)");
+            }
         }
         // The console thread starts first, as in initServer.
         let (tx, console) = mpsc::channel();

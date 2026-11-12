@@ -1,0 +1,19 @@
+[package]
+name = "starter"
+version = "1.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+horizon-plugin-sdk = { path = "../../sdk" }
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+
+[workspace]

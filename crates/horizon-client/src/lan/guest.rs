@@ -338,6 +338,10 @@ pub struct Guest {
     /// The shoulder parrots (Player.DATA_SHOULDER_PARROT_LEFT and _RIGHT) the
     /// player's client was last sent about itself.
     pub sent_shoulders: [Option<i32>; 2],
+    /// The skin layers and main hand (Avatar.DATA_PLAYER_MODE_CUSTOMISATION and
+    /// DATA_PLAYER_MAIN_HAND) the player's client was last sent about itself;
+    /// the entity's defaults (none, right) to start with.
+    pub sent_look: (u8, i32),
     /// Where the player last died (Player.lastDeathLocation), sent with the respawn.
     pub last_death: Option<(String, [i32; 3])>,
     /// The last action sequence to acknowledge at the next tick (-1: none).
@@ -568,6 +572,7 @@ impl Guest {
             sent_shared: 0,
             sent_pose: Pose::Standing,
             sent_shoulders: [None; 2],
+            sent_look: (0, 1),
             last_death: None,
             ack_up_to: std::cell::Cell::new(-1),
             sent_selected: 0,

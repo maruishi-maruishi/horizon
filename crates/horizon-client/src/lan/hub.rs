@@ -3513,6 +3513,18 @@ impl Hub {
                         .unwrap_or_default(),
                     &g.effects.list,
                 );
+                // Avatar.DATA_PLAYER_MAIN_HAND (HumanoidArm, RIGHT by default): the others swing
+                // and hold items in this arm.
+                if g.info.main_hand == 0 {
+                    state
+                        .meta
+                        .push((15, serializer::HUMANOID_ARM, Value::Id(0)));
+                }
+                state
+                    .defaults
+                    .push((15, serializer::HUMANOID_ARM, Value::Id(1)));
+                // Every skin layer turned off is a change back to the default 0.
+                state.defaults.push((16, serializer::BYTE, Value::Byte(0)));
                 state.spectator = g.spectator();
                 state.watching = g.watching;
                 state.hidden = self.hidden.get(&g.uuid).copied();
@@ -3779,6 +3791,25 @@ impl Hub {
         if g.shoulders != g.sent_shoulders {
             let values = shoulder_changes(g.shoulders, g.sent_shoulders);
             g.sent_shoulders = g.shoulders;
+            g.send(&C::SetEntityData(play::SetEntityData {
+                id: g.entity_id,
+                values,
+            }));
+        }
+        // ServerPlayer.updateOptions sets the skin layers and the main hand in
+        // the entity data; sendDirtyEntityData gives them to the player too,
+        // whose client draws its own outer layers, cape and arm from them.
+        let g = &mut self.guests[i];
+        let look = (g.info.model_customisation, g.info.main_hand);
+        if look != g.sent_look {
+            let mut values = Vec::new();
+            if look.0 != g.sent_look.0 {
+                values.push((16, serializer::BYTE, Value::Byte(look.0 as i8)));
+            }
+            if look.1 != g.sent_look.1 {
+                values.push((15, serializer::HUMANOID_ARM, Value::Id(look.1)));
+            }
+            g.sent_look = look;
             g.send(&C::SetEntityData(play::SetEntityData {
                 id: g.entity_id,
                 values,
@@ -5064,6 +5095,9 @@ impl Hub {
             keep: 0,
         }));
         g.sent_pose = crate::pose::Pose::Standing;
+        // The client's new player has the default skin layers and arm; restoreFrom copied the
+        // old ones to the server's, so they are sent again.
+        g.sent_look = (0, 1);
         // ClientPacketListener.handleRespawn without KEEP_ENTITY_DATA: the client's new player
         // starts with wasSprinting false. (A level change keeps it: the new player sprints on, or
         // says STOP.)

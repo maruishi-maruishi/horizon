@@ -1,5 +1,5 @@
 [workspace]
-exclude = ["launcher", "crates/horizon-telemetry-server", "crates/horizon-mod-registry", "third_party/wgpu-hal", "third_party/naga", "third_party/libmimalloc-sys"]
+exclude = ["plugins", "launcher", "crates/horizon-telemetry-server", "crates/horizon-mod-registry", "third_party/wgpu-hal", "third_party/naga", "third_party/libmimalloc-sys"]
 members = [
     "crates/horizon-addresses",
     "crates/horizon-core",
@@ -50,6 +50,7 @@ members = [
     "crates/horizon-shader-api",
     "crates/horizon-release-sign",
     "crates/horizon-mod-deps",
+    "crates/horizon-wasm-plugins",
     "xtask",
 ]
 resolver = "2"

@@ -19,7 +19,8 @@ fn codec(name: &str) -> Result<Compression, Box<dyn Error>> {
         "zlib" | "2" => Ok(Compression::Zlib),
         "none" | "3" => Ok(Compression::None),
         "lz4" | "4" => Ok(Compression::Lz4),
-        _ => Err(format!("unknown codec {name}; choose gzip, zlib, none or lz4").into()),
+        "zstd" | "100" => Ok(Compression::Zstd),
+        _ => Err(format!("unknown codec {name}; choose gzip, zlib, none, lz4 or zstd").into()),
     }
 }
 
@@ -58,10 +59,108 @@ fn run(args: &[String]) -> Result<(), Box<dyn Error>> {
              edit-block-data <source.mca> <new-directory/r.x.z.mca> <x> <y> <z> <name> [property=value ...]\n\
              nbt-copy <input> <new-output> <input-codec> <output-codec>\n\
              nbt-network-copy <input> <new-output> <input-codec> <output-codec>\n\
+             convert-world <world> hzr|mca   (Horizon's storage and back; docs/horizon-storage.md)\n\
+             verify <world> [--repair]       (read every chunk; --repair writes back what parity rebuilt)\n\
+             world-size <world>\n\
+             Run the world commands on a world no game has open.\n\
              Existing output files are refused. edit-block-data changes saved block data only;\n\
              it does not run lighting, heightmaps, ticks or neighbor updates.",
             horizon_core::VANILLA_VERSION
         ),
+        "convert-world" if args.len() == 3 => {
+            use horizon_world::region_convert::{Target, convert_world};
+            let target = match args[2].as_str() {
+                "hzr" => Target::Hzr,
+                "mca" => Target::Mca,
+                other => return Err(format!("unknown format {other}; choose hzr or mca").into()),
+            };
+            let started = std::time::Instant::now();
+            let report = convert_world(Path::new(&args[1]), target, |folder| {
+                eprintln!("converting {folder}")
+            })?;
+            let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+            let change = if report.bytes_before == 0 {
+                0.0
+            } else {
+                (report.bytes_after as f64 / report.bytes_before as f64 - 1.0) * 100.0
+            };
+            println!(
+                "{} chunks in {} folders: {:.1} MiB -> {:.1} MiB ({change:+.1}%) in {:.1} s",
+                report.chunks,
+                report.folders,
+                mib(report.bytes_before),
+                mib(report.bytes_after),
+                started.elapsed().as_secs_f64()
+            );
+        }
+        "verify" if args.len() == 2 || (args.len() == 3 && args[2] == "--repair") => {
+            let repair = args.len() == 3;
+            let health = horizon_world::region_convert::verify_world(
+                Path::new(&args[1]),
+                repair,
+                |folder| eprintln!("checking {folder}"),
+            )?;
+            for (file, chunk, why) in &health.bad {
+                println!(
+                    "BAD {} chunk {} {}: {why}",
+                    file.display(),
+                    chunk.x,
+                    chunk.z
+                );
+            }
+            println!(
+                "{} files, {} chunks: {} bad; {} damaged blocks, {} repaired{}",
+                health.files,
+                health.chunks,
+                health.bad.len(),
+                health.damaged_blocks,
+                health.repaired_blocks,
+                if !repair && health.damaged_blocks > 0 {
+                    " (run with --repair to write them back)"
+                } else {
+                    ""
+                }
+            );
+            if !health.bad.is_empty() {
+                return Err("some chunks can't be read".into());
+            }
+        }
+        "bench-read" if args.len() == 2 => {
+            let started = std::time::Instant::now();
+            let n = horizon_world::region_convert::read_all(Path::new(&args[1]))?;
+            let secs = started.elapsed().as_secs_f64();
+            println!(
+                "{n} chunks read and parsed in {secs:.2} s ({:.0} chunks/s)",
+                n as f64 / secs
+            );
+        }
+        "bench-write" if args.len() == 4 && (args[3] == "hzr" || args[3] == "mca") => {
+            let dest = Path::new(&args[2]);
+            if dest.exists() {
+                return Err("the destination exists; name a new folder".into());
+            }
+            let (n, secs, bytes) = horizon_world::region_convert::write_all(
+                Path::new(&args[1]),
+                dest,
+                args[3] == "hzr",
+            )?;
+            println!(
+                "{n} chunks written as {} in {secs:.2} s ({:.0} chunks/s), {:.1} MiB",
+                args[3],
+                n as f64 / secs,
+                bytes as f64 / (1024.0 * 1024.0)
+            );
+        }
+        "world-size" if args.len() == 2 => {
+            let (mca, hot, cold) = horizon_world::region_convert::world_size(Path::new(&args[1]))?;
+            let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+            println!(
+                "mca: {:.1} MiB\nhzr hot: {:.1} MiB\nhzr cold: {:.1} MiB",
+                mib(mca),
+                mib(hot),
+                mib(cold)
+            );
+        }
         "nbt-copy" | "nbt-network-copy" if args.len() == 5 => {
             let bytes =
                 codec(&args[3])?.decode(&read_bounded(&args[1])?, Limits::default().max_bytes)?;

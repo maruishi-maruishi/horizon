@@ -5,6 +5,7 @@
 use crate::{
     compression::{Compression, invalid},
     nbt::{self, Limits, NamedTag},
+    tiered::{Storage, TieredRegion, storage_for},
 };
 use horizon_core::position::ChunkPos;
 use std::{
@@ -12,7 +13,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU32, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
 const SECTOR: usize = 4096;
@@ -60,7 +64,8 @@ impl ChunkRecord {
     }
 }
 
-pub struct RegionFile {
+/// A vanilla Anvil (`.mca`) region. [`RegionFile`] picks between it and Horizon's `.hzr`.
+pub struct AnvilRegion {
     file: File,
     path: PathBuf,
     position: ChunkPos,
@@ -119,7 +124,7 @@ fn remove_if_exists(path: &Path) -> io::Result<()> {
     }
 }
 
-impl RegionFile {
+impl AnvilRegion {
     pub fn position(&self) -> ChunkPos {
         self.position
     }
@@ -241,6 +246,8 @@ impl RegionFile {
     /// they are. A chunk's last sector is padded with zeros.
     pub fn write(&mut self, chunk: ChunkPos, record: &ChunkRecord) -> io::Result<()> {
         let i = slot(self.position, chunk)?;
+        // Vanilla has no zstd: such a record is stored as zlib.
+        let record = &*for_anvil(record)?;
         if record.compressed.len() > MAX_COMPRESSED {
             return Err(invalid("compressed chunk limit exceeded"));
         }
@@ -417,6 +424,160 @@ impl RegionFile {
         writer.finish()
     }
 }
+/// The record as an Anvil file may hold it: zstd (Horizon's own codec) becomes zlib.
+pub fn for_anvil(record: &ChunkRecord) -> io::Result<std::borrow::Cow<'_, ChunkRecord>> {
+    if record.compression == Compression::Zstd {
+        crate::hzr::recompress(record, Compression::Zlib)
+    } else {
+        Ok(std::borrow::Cow::Borrowed(record))
+    }
+}
+
+/// A region file of a world. Callers name the vanilla path (`dir/r.X.Z.mca`). In a world in
+/// Horizon's storage (one with [`crate::tiered::MARKER`]) the region is the two tiers of
+/// [`crate::tiered`] instead; the game never converts a world from one to the other.
+pub struct RegionFile(Inner);
+
+enum Inner {
+    Anvil(AnvilRegion),
+    Tiered(TieredRegion),
+}
+
+fn tiered_storage(path: &Path) -> Option<(PathBuf, Arc<Storage>)> {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    storage_for(dir).map(|s| (dir.to_owned(), s))
+}
+
+impl RegionFile {
+    pub fn position(&self) -> ChunkPos {
+        match &self.0 {
+            Inner::Anvil(r) => r.position(),
+            Inner::Tiered(r) => r.position(),
+        }
+    }
+    /// Whether this region is in Horizon's storage.
+    pub fn is_hzr(&self) -> bool {
+        matches!(self.0, Inner::Tiered(_))
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref();
+        if let Some((dir, storage)) = tiered_storage(path) {
+            return TieredRegion::open(&dir, position_from_path(path)?, storage, false)
+                .map(|r| Self(Inner::Tiered(r)));
+        }
+        AnvilRegion::open(path).map(|r| Self(Inner::Anvil(r)))
+    }
+
+    /// Open for reading and in-place writes (`write`, `clear`), creating an empty region with
+    /// `create`.
+    pub fn open_writable(path: impl AsRef<Path>, create: bool) -> io::Result<Self> {
+        let path = path.as_ref();
+        if let Some((dir, storage)) = tiered_storage(path) {
+            return TieredRegion::open(&dir, position_from_path(path)?, storage, create)
+                .map(|r| Self(Inner::Tiered(r)));
+        }
+        AnvilRegion::open_writable(path, create).map(|r| Self(Inner::Anvil(r)))
+    }
+
+    pub fn write(&mut self, chunk: ChunkPos, record: &ChunkRecord) -> io::Result<()> {
+        match &mut self.0 {
+            Inner::Anvil(r) => r.write(chunk, record),
+            Inner::Tiered(r) => r.write(chunk, record),
+        }
+    }
+    pub fn clear(&mut self, chunk: ChunkPos, timestamp: u32) -> io::Result<bool> {
+        match &mut self.0 {
+            Inner::Anvil(r) => r.clear(chunk, timestamp),
+            Inner::Tiered(r) => r.clear(chunk, timestamp),
+        }
+    }
+    pub fn sync(&self) -> io::Result<()> {
+        match &self.0 {
+            Inner::Anvil(r) => r.sync(),
+            Inner::Tiered(r) => r.sync(),
+        }
+    }
+    pub fn chunks(&self) -> Box<dyn Iterator<Item = (ChunkPos, u32)> + '_> {
+        match &self.0 {
+            Inner::Anvil(r) => Box::new(r.chunks()),
+            Inner::Tiered(r) => Box::new(r.chunks().into_iter()),
+        }
+    }
+    pub fn read(&mut self, chunk: ChunkPos) -> io::Result<Option<ChunkRecord>> {
+        match &mut self.0 {
+            Inner::Anvil(r) => r.read(chunk),
+            Inner::Tiered(r) => r.read(chunk),
+        }
+    }
+
+    /// Export all chunks to a new `.mca` file `destination`, preserving untouched chunks and
+    /// timestamps. Overrides are keyed by chunk position; None deletes a chunk in the export.
+    pub fn export(
+        &mut self,
+        destination: impl AsRef<Path>,
+        changes: &[(ChunkPos, Option<ChunkRecord>)],
+    ) -> io::Result<()> {
+        let destination = destination.as_ref();
+        if let Inner::Anvil(r) = &mut self.0 {
+            return r.export(destination, changes);
+        }
+        let region = self.position();
+        if position_from_path(destination)? != region {
+            return Err(invalid("export region coordinates differ"));
+        }
+        let mut replacements = BTreeChanges::new();
+        for (chunk, record) in changes {
+            if replacements
+                .insert(slot(region, *chunk)?, record.as_ref())
+                .is_some()
+            {
+                return Err(invalid("duplicate chunk override"));
+            }
+        }
+        let mut writer = RegionWriter::create(destination)?;
+        for i in 0..1024 {
+            let chunk = position(region, i);
+            match replacements.get(&i) {
+                Some(Some(record)) => writer.write(chunk, record)?,
+                Some(None) => {}
+                None => {
+                    if let Some(record) = self.read(chunk)? {
+                        writer.write(chunk, &record)?;
+                    }
+                }
+            }
+        }
+        writer.finish()
+    }
+}
+
+/// Remove an Anvil region and the external `.mcc` chunks beside it that belong to it.
+pub fn remove_anvil(mca: &Path) -> io::Result<()> {
+    let region = position_from_path(mca)?;
+    let directory = mca.parent().unwrap_or(Path::new("."));
+    for i in 0..1024 {
+        remove_if_exists(&external_path(directory, position(region, i)))?;
+    }
+    remove_if_exists(mca)
+}
+
+/// A `.mca` file's bytes with its `.mcc` chunks.
+pub fn anvil_bytes(mca: &Path) -> io::Result<u64> {
+    let region = position_from_path(mca)?;
+    let directory = mca.parent().unwrap_or(Path::new("."));
+    let mut total = fs::metadata(mca)?.len();
+    for i in 0..1024 {
+        if let Ok(m) = fs::metadata(external_path(directory, position(region, i))) {
+            total += m.len();
+        }
+    }
+    Ok(total)
+}
+
 type BTreeChanges<'a> = std::collections::BTreeMap<usize, Option<&'a ChunkRecord>>;
 
 static NEXT_TEMP: AtomicU32 = AtomicU32::new(0);
@@ -496,6 +657,7 @@ impl RegionWriter {
 
     fn write_record(&mut self, chunk: ChunkPos, record: &ChunkRecord) -> io::Result<()> {
         let i = slot(self.position, chunk)?;
+        let record = &*for_anvil(record)?;
         if self.offsets[i] != 0 {
             return Err(invalid("chunk already written"));
         }
@@ -594,7 +756,7 @@ mod tests {
             std::env::temp_dir().join(format!("horizon-region-first-free-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("r.0.0.mca");
-        let mut region = RegionFile::open_writable(&path, true).unwrap();
+        let mut region = AnvilRegion::open_writable(&path, true).unwrap();
 
         let mut seed = 0x1234_5678u64;
         let mut next = move || {

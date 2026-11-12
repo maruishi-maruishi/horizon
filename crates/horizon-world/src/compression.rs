@@ -12,6 +12,28 @@ pub enum Compression {
     Zlib = 2,
     None = 3,
     Lz4 = 4,
+    /// Horizon's own: zstd, used only inside `.hzr` region files ([`crate::hzr`]). Vanilla has no
+    /// id for it, so a record in this codec is recompressed with zlib before it goes into an
+    /// Anvil (`.mca`) file.
+    Zstd = 100,
+}
+
+/// The zstd level `.hzr` files are written with: about zlib's default ratio at several times
+/// its speed, and it decodes several times faster.
+pub const ZSTD_LEVEL: i32 = 3;
+
+/// Whether this server keeps its regions in Horizon's `.hzr` format (`horizon-region-format=hzr`
+/// in server.properties) instead of vanilla's Anvil `.mca`. Off by default: worlds stay vanilla's.
+static HORIZON_FORMAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Choose the region format new and rewritten region files use ([`HORIZON_FORMAT`]).
+pub fn set_horizon_format(on: bool) {
+    HORIZON_FORMAT.store(on, Ordering::Relaxed);
+}
+
+/// Whether region files are written as `.hzr` ([`set_horizon_format`]).
+pub fn horizon_format() -> bool {
+    HORIZON_FORMAT.load(Ordering::Relaxed)
 }
 
 /// The region file versions `RegionFileVersion.register` puts in its table, in
@@ -42,6 +64,9 @@ impl Compression {
     /// `RegionFileVersion.getSelected`: the version a chunk or a poi region
     /// is written with.
     pub fn selected() -> Self {
+        if horizon_format() {
+            return Self::Zstd;
+        }
         Self::try_from(SELECTED.load(Ordering::Relaxed)).unwrap_or(Self::Zlib)
     }
 }
@@ -58,6 +83,7 @@ impl TryFrom<u8> for Compression {
             2 => Ok(Self::Zlib),
             3 => Ok(Self::None),
             4 => Ok(Self::Lz4),
+            100 => Ok(Self::Zstd),
             _ => Err(invalid(format!(
                 "unsupported region compression ID {value}"
             ))),
@@ -101,6 +127,16 @@ impl Compression {
             Self::Lz4 => {
                 LZ4_BUFFER.with_borrow_mut(|buffer| decode_lz4(bytes, max_output, output, buffer))
             }
+            Self::Zstd => {
+                let decoder = zstd::stream::read::Decoder::new(bytes)?;
+                decoder
+                    .take((max_output as u64).saturating_add(1))
+                    .read_to_end(output)?;
+                if output.len() > max_output {
+                    return Err(invalid("decompression limit exceeded"));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -118,11 +154,20 @@ impl Compression {
                 encoder.finish()
             }
             Self::Lz4 => Ok(encode_lz4(bytes)),
+            Self::Zstd => ZSTD.with_borrow_mut(|compressor| {
+                let compressor = match compressor {
+                    Some(c) => c,
+                    None => compressor.insert(zstd::bulk::Compressor::new(ZSTD_LEVEL)?),
+                };
+                compressor.compress(bytes)
+            }),
         }
     }
 }
 
 thread_local! {
+    /// This thread's zstd compression context, kept between chunks.
+    static ZSTD: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> = const { std::cell::RefCell::new(None) };
     /// This thread's zlib inflater, reset for each chunk instead of a new
     /// one (and its window) allocated every time.
     static INFLATER: std::cell::RefCell<Option<Decompress>> = const { std::cell::RefCell::new(None) };
